@@ -1,0 +1,20 @@
+# Build output
+bin/
+obj/
+publish/
+installer-out/
+TestResults/
+
+# Visual Studio / VS Code
+.vs/
+*.user
+*.suo
+.vscode/
+
+# Signing material - never commit
+*.pfx
+*.cer
+
+# Logs
+*.log
+*-log.txt

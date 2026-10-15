@@ -1,0 +1,90 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Resolve version from tag
+        id: ver
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart('v')
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Test
+        run: dotnet test -c Release
+
+      - name: Publish
+        run: >
+          dotnet publish SampleApp -c Release -r win-x64 --self-contained
+          -p:Version=${{ steps.ver.outputs.version }}
+          -p:PublishSingleFile=true
+          -o publish
+
+      - name: Restore signing certificate
+        shell: pwsh
+        run: |
+          $bytes = [Convert]::FromBase64String("${{ secrets.SIGNING_CERT_BASE64 }}")
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", $bytes)
+
+      - name: Locate signtool
+        id: signtool
+        shell: pwsh
+        run: |
+          $st = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+                Sort-Object FullName -Descending | Select-Object -First 1
+          "path=$($st.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Sign application
+        shell: pwsh
+        run: |
+          & "${{ steps.signtool.outputs.path }}" sign `
+            /f "$env:RUNNER_TEMP\cert.pfx" `
+            /p "${{ secrets.SIGNING_CERT_PASSWORD }}" `
+            /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+            publish\SampleApp.exe
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            /DAppVersion=${{ steps.ver.outputs.version }} `
+            installer\SampleApp.iss
+
+      - name: Sign installer
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem installer-out\*.exe | Select-Object -First 1
+          & "${{ steps.signtool.outputs.path }}" sign `
+            /f "$env:RUNNER_TEMP\cert.pfx" `
+            /p "${{ secrets.SIGNING_CERT_PASSWORD }}" `
+            /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+            $setup.FullName
+
+      - name: Verify signatures
+        shell: pwsh
+        run: |
+          Get-AuthenticodeSignature publish\SampleApp.exe, installer-out\*.exe |
+            Format-List Path, Status, SignerCertificate
+
+      - name: Remove certificate
+        if: always()
+        shell: pwsh
+        run: Remove-Item "$env:RUNNER_TEMP\cert.pfx" -Force -ErrorAction SilentlyContinue
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer-out/*.exe
+          generate_release_notes: true
