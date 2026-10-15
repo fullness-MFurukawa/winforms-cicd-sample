@@ -1,17 +1,33 @@
+# CI ワークフロー: main への push と Pull Request でビルドとテストを実行する
+# 成果物は作らない。「壊れたコードが main に入っていないか」を確認するのが役割
 name: CI
+
+# 起動条件
 on:
   push:
-    branches: [main]
-  pull_request:
+    branches: [main]      # main ブランチへの push
+  pull_request:           # Pull Request の作成・更新
 
 jobs:
   test:
+    # WinForms は Windows でしかビルドできないため Windows ランナーを使う
     runs-on: windows-latest
+
     steps:
+      # リポジトリのソースをランナーに取得する
       - uses: actions/checkout@v4
+
+      # .NET SDK 8.0 系をインストールする（プロジェクトの TargetFramework に合わせる）
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+
+      # NuGet パッケージを復元する
       - run: dotnet restore
+
+      # Release 構成でビルドする。restore は済んでいるので --no-restore で省略
       - run: dotnet build -c Release --no-restore
+
+      # ビルド済みのバイナリでテストを実行する。--no-build で再ビルドを省略
+      # 1 件でも失敗するとこのワークフローは赤になる
       - run: dotnet test -c Release --no-build

@@ -1,4 +1,8 @@
+# Release ワークフロー: v で始まるタグが push されたときだけ動く
+# テスト → publish → 署名 → インストーラー作成 → 署名 → GitHub Releases に公開
 name: Release
+
+# 起動条件: v0.1.0 のようなタグの push。通常の push では動かない
 on:
   push:
     tags: ['v*']
@@ -6,15 +10,23 @@ on:
 jobs:
   release:
     runs-on: windows-latest
+
+    # Release の作成とファイル添付に必要な書き込み権限
+    # これがないと最後のステップで 403 エラーになる
     permissions:
       contents: write
+
     steps:
+      # リポジトリのソースをランナーに取得する
       - uses: actions/checkout@v4
 
+      # .NET SDK 8.0 系をインストールする
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
+      # タグ名 "v0.1.0" から先頭の v を取り除き "0.1.0" を取り出す
+      # 以降のステップでは ${{ steps.ver.outputs.version }} で参照できる
       - name: Resolve version from tag
         id: ver
         shell: pwsh
@@ -22,9 +34,15 @@ jobs:
           $v = "${{ github.ref_name }}".TrimStart('v')
           "version=$v" >> $env:GITHUB_OUTPUT
 
+      # CI と同じテストをもう一度実行する
+      # ここで失敗すればインストーラーは作られない
       - name: Test
         run: dotnet test -c Release
 
+      # 配布用バイナリを publish/ フォルダに出力する
+      #   -r win-x64 --self-contained : .NET ランタイムを同梱（.NET 未導入の PC でも動く）
+      #   -p:Version=0.1.0            : タグ由来のバージョンを exe に焼き込む
+      #   -p:PublishSingleFile=true   : DLL 群を 1 つの exe にまとめる
       - name: Publish
         run: >
           dotnet publish SampleApp -c Release -r win-x64 --self-contained
@@ -32,12 +50,16 @@ jobs:
           -p:PublishSingleFile=true
           -o publish
 
+      # Secrets に入れた Base64 文字列をバイト列に戻し、一時フォルダに cert.pfx として書き出す
+      # 証明書はリポジトリには置かず、実行中のランナーにだけ一時的に存在させる
       - name: Restore signing certificate
         shell: pwsh
         run: |
           $bytes = [Convert]::FromBase64String("${{ secrets.SIGNING_CERT_BASE64 }}")
           [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", $bytes)
 
+      # Windows SDK に含まれる signtool.exe のパスを探す
+      # SDK のバージョンフォルダ名はランナー更新で変わるため、ワイルドカードで最新を取る
       - name: Locate signtool
         id: signtool
         shell: pwsh
@@ -46,6 +68,10 @@ jobs:
                 Sort-Object FullName -Descending | Select-Object -First 1
           "path=$($st.FullName)" >> $env:GITHUB_OUTPUT
 
+      # アプリ本体の exe に署名する
+      #   /f  : 証明書ファイル        /p  : 証明書のパスワード
+      #   /fd : ファイルのハッシュ方式 /tr : タイムスタンプサーバー（証明書期限切れ後も署名を有効に保つ）
+      #   /td : タイムスタンプのハッシュ方式
       - name: Sign application
         shell: pwsh
         run: |
@@ -55,6 +81,10 @@ jobs:
             /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
             publish\SampleApp.exe
 
+      # Inno Setup でインストーラーを作る（ランナーにプリインストール済み）
+      #   /DAppVersion=0.1.0 で .iss 内の AppVersion を上書き
+      #   .iss の [Files] が publish\* を取り込むので、署名済み exe がインストーラーに入る
+      #   出力先: installer-out/SampleAppSetup-0.1.0.exe
       - name: Build installer
         shell: pwsh
         run: |
@@ -62,6 +92,8 @@ jobs:
             /DAppVersion=${{ steps.ver.outputs.version }} `
             installer\SampleApp.iss
 
+      # インストーラーの exe にも同じ証明書で署名する
+      # 利用者が最初に実行するのはインストーラーなので、ここに署名がないと SmartScreen が「不明な発行元」を出す
       - name: Sign installer
         shell: pwsh
         run: |
@@ -72,17 +104,23 @@ jobs:
             /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
             $setup.FullName
 
+      # 署名の状態をログに出す
+      # 自己署名なので Status は UnknownError になるが、SignerCertificate が入っていれば署名は付いている
       - name: Verify signatures
         shell: pwsh
         run: |
           Get-AuthenticodeSignature publish\SampleApp.exe, installer-out\*.exe |
             Format-List Path, Status, SignerCertificate
 
+      # 一時フォルダの証明書を削除する
+      # if: always() により、前のステップが失敗していても必ず実行される
       - name: Remove certificate
         if: always()
         shell: pwsh
         run: Remove-Item "$env:RUNNER_TEMP\cert.pfx" -Force -ErrorAction SilentlyContinue
 
+      # タグ名で Release を作成し、インストーラーを添付する
+      # generate_release_notes: true で前回タグからの変更履歴（マージされた PR 一覧）を自動生成
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
